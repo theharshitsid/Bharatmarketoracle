@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef } from "react";
 
-const MODEL = "claude-sonnet-4-6";
+// ─── Models ────────────────────────────────────────────────────────────────
+// Sonnet for market cycle (needs judgment) — Haiku for stocks (10x cheaper, fast)
+const MODEL_SONNET = "claude-sonnet-4-6";
+const MODEL_HAIKU  = "claude-haiku-4-5-20251001";
 
 // ─── JSON repair + parse ───────────────────────────────────────────────────
 function safeParseJSON(raw) {
@@ -16,22 +19,20 @@ function safeParseJSON(raw) {
 }
 
 // ─── API call ──────────────────────────────────────────────────────────────
-// LOCAL DEV  (npm run dev)  → calls Anthropic directly via VITE_ANTHROPIC_API_KEY in .env.local
-// NETLIFY production        → calls /.netlify/functions/claude  (key stays server-side)
+// LOCAL DEV  → calls Anthropic directly via VITE_ANTHROPIC_API_KEY in .env.local
+// NETLIFY    → calls /.netlify/functions/claude (key stays server-side)
 const IS_LOCAL = import.meta.env.DEV;
 const API_URL  = IS_LOCAL
   ? "https://api.anthropic.com/v1/messages"
   : "/.netlify/functions/claude";
 
-async function callClaude(prompt, maxTokens) {
+async function callClaude(prompt, maxTokens, model) {
+  model = model || MODEL_SONNET;
+
   if (IS_LOCAL && !import.meta.env.VITE_ANTHROPIC_API_KEY) {
-    throw new Error(
-      "Missing API key. Create a .env.local file in the project root:\nVITE_ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxx"
-    );
+    throw new Error("Missing API key. Add VITE_ANTHROPIC_API_KEY=sk-ant-... to .env.local");
   }
 
-  // In local dev we call Anthropic directly — the special header opts-in to browser access.
-  // On Netlify the request goes to our serverless proxy which adds the key server-side.
   const headers = {
     "Content-Type": "application/json",
     ...(IS_LOCAL && {
@@ -45,8 +46,8 @@ async function callClaude(prompt, maxTokens) {
     method: "POST",
     headers,
     body: JSON.stringify({
-      model: MODEL,
-      max_tokens: maxTokens || 4000,
+      model,
+      max_tokens: maxTokens || 3000,
       tools: [{ type: "web_search_20250305", name: "web_search" }],
       messages: [{ role: "user", content: prompt }]
     })
@@ -65,46 +66,54 @@ async function callClaude(prompt, maxTokens) {
   return safeParseJSON(text);
 }
 
-// ─── Prompts ───────────────────────────────────────────────────────────────
-const CYCLE_PROMPT = `You are an Indian equity analyst. Search the web for CURRENT data (May 2026):
-1. India VIX level and direction
-2. FII net equity flows last 3 months (NSE/NSDL)
-3. % of Nifty 500 stocks above 200-day moving average
-4. USD/INR trend last 3 months
-5. IPO activity last 6 months (quantity and quality)
-6. QIP and promoter stake sales last 12 months
-7. BSE SmallCap index performance vs peak
-8. Retail sentiment (SIP flows, social media, Google Trends)
+// ─── localStorage cache (2 hr TTL) ────────────────────────────────────────
+const CACHE_KEY = "bmo_v1";
+const CACHE_TTL = 2 * 60 * 60 * 1000;
 
-Gautam Baid market cycle stages:
-BULL_STAGE_1: Bear ended, beaten-down bounce hardest, broad recovery
-BULL_STAGE_2: Narrow market, sectoral rotation, quality rewarded, longest phase
-BULL_STAGE_3: Euphoria, record QIPs, dubious IPOs 200x oversubscribed, insiders exiting
-BEAR_STAGE_1: 20-25% fall, buy-the-dip mentality, confidence still high
-BEAR_STAGE_2: Good earnings not rewarded, stocks fall on positive results
-BEAR_STAGE_3: 60-70% small cap fall, record FII outflow, VIX>25, under 20% above 200DMA, sentiment collapse
-TRANSITION_BEAR_TO_BULL: Exhaustion reversal day, Stage3 bear just ended
-TRANSITION_BULL_TO_BEAR: Stage3 bull indicators firing
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const { ts, cycle, stocks } = JSON.parse(raw);
+    if (Date.now() - ts > CACHE_TTL) { localStorage.removeItem(CACHE_KEY); return null; }
+    return { cycle, stocks };
+  } catch { return null; }
+}
 
-Return ONLY raw JSON. No markdown. No backticks. All strings under 100 chars.
-{"marketStage":"BULL_STAGE_1","overallScore":62,"stageDescription":"Two sentence description based on data","timestamp":"May 2026","lastUpdated":"Data as of 19 May 2026","indicators":{"vix":{"value":"18.3","score":63,"interpretation":"12 words max","trend":"DOWN"},"fiiFlows":{"value":"Rs 14200Cr Apr26","score":67,"interpretation":"12 words max","trend":"UP"},"pctAbove200dma":{"value":"31%","score":31,"interpretation":"12 words max","trend":"UP"},"rupeePerformance":{"value":"Rs84.2 stable","score":50,"interpretation":"12 words max","trend":"STABLE"},"ipoActivity":{"value":"7 IPOs quality only","score":70,"interpretation":"12 words max","trend":"LOW"},"qipActivity":{"value":"Rs4200Cr 2026","score":75,"interpretation":"12 words max","trend":"LOW"},"smallcapPerformance":{"value":"BSE SmCap +15%","score":52,"interpretation":"12 words max","trend":"UP"},"sentimentScore":{"value":"26/100","score":26,"interpretation":"12 words max","trend":"BEARISH"}},"marketOutlook":"3 sentences max","keyRisks":["risk1 max 12 words","risk2","risk3","risk4"]}`;
+function saveCache(cycle, stocks) {
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), cycle, stocks })); } catch {}
+}
 
-const STOCKS_PROMPT = `You are an Indian equity analyst. Search the web for current NSE stock data (May 2026).
+function clearCache() {
+  try { localStorage.removeItem(CACHE_KEY); } catch {}
+}
 
-Gautam Baid quality filter: ROIC>WACC AND competitive moat AND high reinvestment potential (compounding machine).
-Current bull themes: Power ancillaries, Defence aerospace, Innovator CDMO pharma, Domestic consumption, Precision engineering exports.
+// ─── Prompts (trimmed to minimum tokens) ──────────────────────────────────
+// CYCLE: ~800 tokens input (was ~1400)
+const CYCLE_PROMPT = `Indian equity analyst. Search web for CURRENT data today:
+1.India VIX level+direction 2.FII net equity flows last 3mo (NSE/NSDL) 3.% Nifty500 stocks above 200DMA 4.USD/INR trend last 3mo 5.IPO activity last 6mo quality+quantity 6.QIP+promoter sales last 12mo 7.BSE SmallCap vs peak 8.SIP flows+retail sentiment
 
-Give exactly 7 HIGH risk (small cap), 7 MEDIUM risk (midcap), 5 LOW risk (large cap). Real NSE tickers only.
-Give 5 sector picks.
+Gautam Baid stages: BULL_STAGE_1=broad recovery after bear BULL_STAGE_2=sectoral rotation quality rewarded BULL_STAGE_3=euphoria record QIPs dubious IPOs BEAR_STAGE_1=buy-dip mentality BEAR_STAGE_2=good earnings ignored BEAR_STAGE_3=60-70% fall VIX>25 <20% above 200DMA TRANSITION_BEAR_TO_BULL TRANSITION_BULL_TO_BEAR
 
-Return ONLY raw JSON. No markdown. All strings under 80 chars. reasoning max 15 words. catalysts/risks max 8 words each.
-{"high":[{"ticker":"SUZLON","name":"Suzlon Energy","sector":"Renewable Energy","cap":"SmMid","verdict":"BUY","return":"50-70%","horizon":"18-24m","reasoning":"15 words max","catalysts":["cat1","cat2","cat3"],"risks":["r1","r2"]},{"ticker":"TICK2","name":"Name2","sector":"Sector","cap":"Small","verdict":"BUY","return":"55-70%","horizon":"18m","reasoning":"reasoning","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"TICK3","name":"Name3","sector":"Sector","cap":"Small","verdict":"BUY","return":"60-80%","horizon":"24m","reasoning":"reasoning","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"TICK4","name":"Name4","sector":"Sector","cap":"Small","verdict":"BUY","return":"50-65%","horizon":"18m","reasoning":"reasoning","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"TICK5","name":"Name5","sector":"Sector","cap":"Small","verdict":"BUY","return":"55-75%","horizon":"20m","reasoning":"reasoning","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"TICK6","name":"Name6","sector":"Sector","cap":"Small","verdict":"BUY","return":"60-80%","horizon":"24m","reasoning":"reasoning","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"TICK7","name":"Name7","sector":"Sector","cap":"Small","verdict":"BUY","return":"45-60%","horizon":"18m","reasoning":"reasoning","catalysts":["c1","c2","c3"],"risks":["r1","r2"]}],"medium":[{"ticker":"M1","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"30-40%","horizon":"18m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"M2","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"25-35%","horizon":"18m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"M3","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"30-45%","horizon":"18m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"M4","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"25-35%","horizon":"15m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"M5","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"35-50%","horizon":"18m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"M6","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"30-40%","horizon":"18m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"M7","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"25-30%","horizon":"15m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]}],"low":[{"ticker":"L1","name":"N","sector":"S","cap":"Large","verdict":"BUY","return":"18-22%","horizon":"12m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"L2","name":"N","sector":"S","cap":"Large","verdict":"BUY","return":"20-25%","horizon":"12m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"L3","name":"N","sector":"S","cap":"Large","verdict":"BUY","return":"18-25%","horizon":"12m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"L4","name":"N","sector":"S","cap":"Large","verdict":"BUY","return":"20-28%","horizon":"15m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]},{"ticker":"L5","name":"N","sector":"S","cap":"Large","verdict":"HOLD","return":"12-18%","horizon":"12m","reasoning":"r","catalysts":["c1","c2","c3"],"risks":["r1","r2"]}],"sectors":[{"name":"Power and Energy Ancillaries","conviction":"HIGH","theme":"Theme max 15 words","horizon":"3-5yr"},{"name":"Defence and Aerospace","conviction":"HIGH","theme":"Theme max 15 words","horizon":"5-7yr"},{"name":"Innovator CDMO Pharma","conviction":"HIGH","theme":"Theme max 15 words","horizon":"3-5yr"},{"name":"Domestic Consumption","conviction":"MEDIUM","theme":"Theme max 15 words","horizon":"1-2yr"},{"name":"Auto Ancillary Exports","conviction":"MEDIUM","theme":"Theme max 15 words","horizon":"2-4yr"}]}`;
+Return ONLY raw JSON no markdown all strings under 80 chars:
+{"marketStage":"BULL_STAGE_1","overallScore":62,"stageDescription":"2 sentences based on actual data","timestamp":"May 2026","lastUpdated":"19 May 2026","indicators":{"vix":{"value":"18.3","score":63,"interpretation":"under 12 words","trend":"DOWN"},"fiiFlows":{"value":"Rs14200Cr","score":67,"interpretation":"under 12 words","trend":"UP"},"pctAbove200dma":{"value":"31%","score":31,"interpretation":"under 12 words","trend":"UP"},"rupeePerformance":{"value":"Rs84.2","score":50,"interpretation":"under 12 words","trend":"STABLE"},"ipoActivity":{"value":"7 IPOs","score":70,"interpretation":"under 12 words","trend":"LOW"},"qipActivity":{"value":"Rs4200Cr","score":75,"interpretation":"under 12 words","trend":"LOW"},"smallcapPerformance":{"value":"+15% from low","score":52,"interpretation":"under 12 words","trend":"UP"},"sentimentScore":{"value":"26/100","score":26,"interpretation":"under 12 words","trend":"BEARISH"}},"marketOutlook":"2 sentences max","keyRisks":["r1 under 12 words","r2","r3"]}`;
 
-const STOCK_PROMPT = q => `Analyse NSE/BSE stock "${q}" using Gautam Baid and Warren Buffett value investing framework.
-Search web for CURRENT price, latest quarterly results, recent news.
-Evaluate: ROIC vs WACC, moat, reinvestment potential, management quality, sectoral tailwind, valuation.
-Return ONLY raw JSON. No markdown. All strings under 100 chars.
-{"ticker":"TICK","name":"Full Name","sector":"Sector","cap":"Large/Mid/Small Rs XXCr","verdict":"BUY","conviction":"HIGH","price":"Rs XXX","target":"Rs XXX","horizon":"12-18 months","upside":"XX-YY%","biz":{"score":8,"roic":"ROIC vs WACC desc","moat":"moat desc","reinvest":"reinvestment desc","compounder":true},"mgmt":{"score":7,"share":"market share trend","growth":"organic growth desc","margins":"margin consistency"},"val":{"pe":"XX","pb":"X.X","evebitda":"XX","view":"CHEAP"},"tailwind":"STRONG","bull":["reason1","reason2","reason3"],"bear":["risk1","risk2"],"technical":"price vs 200DMA and RS","gbFilter":"PASS plus 1 sentence reason"}`;
+// STOCKS: ~900 tokens input (was ~4500 — the big saving)
+const STOCKS_PROMPT = `Indian equity analyst. Search web for NSE stock data today.
+Quality filter: ROIC>WACC + moat + high reinvestment potential (compounding machine not dividend payer).
+Bull themes: Power ancillaries, Defence/aerospace, Innovator CDMO pharma, Domestic consumption, Precision engineering exports.
+
+Give 7 HIGH(small cap) + 7 MEDIUM(midcap) + 5 LOW(large cap). Real NSE tickers only. Give 5 sector picks.
+All strings under 60 chars. reasoning=10 words max. catalysts/risks=6 words max.
+
+Return ONLY raw JSON no markdown. Use this exact structure:
+{"high":[{"ticker":"SUZLON","name":"Suzlon Energy","sector":"Renewable","cap":"SmMid","verdict":"BUY","return":"50-70%","horizon":"18m","reasoning":"10 words max","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Small","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Small","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Small","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Small","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Small","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Small","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]}],"medium":[{"ticker":"T","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Mid","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]}],"low":[{"ticker":"T","name":"N","sector":"S","cap":"Large","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Large","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Large","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Large","verdict":"BUY","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]},{"ticker":"T","name":"N","sector":"S","cap":"Large","verdict":"HOLD","return":"X%","horizon":"Xm","reasoning":"r","catalysts":["c1","c2"],"risks":["r1"]}],"sectors":[{"name":"Power Ancillaries","conviction":"HIGH","theme":"10 words","horizon":"3-5yr"},{"name":"Defence Aerospace","conviction":"HIGH","theme":"10 words","horizon":"5-7yr"},{"name":"Innovator CDMO","conviction":"HIGH","theme":"10 words","horizon":"3-5yr"},{"name":"Domestic Consumption","conviction":"MEDIUM","theme":"10 words","horizon":"1-2yr"},{"name":"Precision Eng Exports","conviction":"MEDIUM","theme":"10 words","horizon":"2-4yr"}]}`;
+
+// STOCK SEARCH: ~400 tokens input (was ~550)
+const STOCK_PROMPT = q => `Analyse NSE/BSE stock "${q}". Search web for current price, latest results, recent news.
+Evaluate: ROIC vs WACC, moat, reinvestment, mgmt quality, sectoral tailwind, valuation.
+Return ONLY raw JSON no markdown strings under 80 chars:
+{"ticker":"T","name":"N","sector":"S","cap":"Large Rs XXCr","verdict":"BUY","conviction":"HIGH","price":"RsX","target":"RsX","horizon":"12-18m","upside":"XX%","biz":{"score":8,"roic":"brief","moat":"brief","reinvest":"brief","compounder":true},"mgmt":{"score":7,"share":"brief","growth":"brief","margins":"brief"},"val":{"pe":"X","pb":"X","evebitda":"X","view":"FAIR"},"tailwind":"STRONG","bull":["r1","r2","r3"],"bear":["r1","r2"],"technical":"brief","gbFilter":"PASS - 1 sentence"}`;
 
 // ─── Design tokens ─────────────────────────────────────────────────────────
 const C = {
@@ -387,7 +396,7 @@ function Skeleton({ h, w, r }) {
   return <div style={{ height: h || 16, width: w || "100%", borderRadius: r || 4, background: "rgba(255,255,255,0.04)", backgroundImage: "linear-gradient(90deg,rgba(255,255,255,0.02) 0%,rgba(255,255,255,0.06) 50%,rgba(255,255,255,0.02) 100%)", backgroundSize: "400px 100%", animation: "shimmer 2s infinite" }} />;
 }
 
-// ─── Main Component Export ───────────────────────────────────────────────────
+// ─── Main Component ────────────────────────────────────────────────────────
 export default function BharatOracle() {
   const [phase,         setPhase]         = useState("idle");
   const [cycleData,     setCycleData]     = useState(null);
@@ -400,6 +409,7 @@ export default function BharatOracle() {
   const [msgIdx,        setMsgIdx]        = useState(0);
   const [errMsg,        setErrMsg]        = useState("");
   const [showOutlook,   setShowOutlook]   = useState(false);
+  const [fromCache,     setFromCache]     = useState(false);
   const timer = useRef(null);
 
   useEffect(() => {
@@ -409,28 +419,52 @@ export default function BharatOracle() {
     return () => clearInterval(timer.current);
   }, [phase]);
 
-  async function analyseMarket() {
+  async function analyseMarket(forceRefresh = false) {
+    // Serve from cache if fresh (skip API entirely)
+    if (!forceRefresh) {
+      const cached = loadCache();
+      if (cached) {
+        setCycleData(cached.cycle);
+        setStocksData(cached.stocks);
+        setFromCache(true);
+        setPhase("done");
+        return;
+      }
+    }
+
     setPhase("loading"); setStep(0); setMsgIdx(0); setErrMsg("");
-    setCycleData(null); setStocksData(null);
+    setFromCache(false); setCycleData(null); setStocksData(null);
+
     try {
+      // Step 1 — Market cycle: Sonnet (needs reasoning + web search)
       setStep(0);
-      const cycle = await callClaude(CYCLE_PROMPT, 2500);
+      const cycle = await callClaude(CYCLE_PROMPT, 2000, MODEL_SONNET);
       setCycleData(cycle);
+
+      // Step 2 — Stock picks: Haiku (~10x cheaper, still uses web search)
       setStep(1); setMsgIdx(0);
-      const stocks = await callClaude(STOCKS_PROMPT, 5000);
+      const stocks = await callClaude(STOCKS_PROMPT, 3500, MODEL_HAIKU);
       setStocksData(stocks);
+
+      saveCache(cycle, stocks);
       setPhase("done");
     } catch (e) {
-      setErrMsg(e.message || "Analysis failed"); setPhase("error");
+      setErrMsg(e.message || "Analysis failed");
+      setPhase("error");
     }
   }
 
   async function analyseStock() {
     if (!stockQuery.trim()) return;
     setStockLoading(true); setStockResult(null);
-    try { setStockResult(await callClaude(STOCK_PROMPT(stockQuery.trim()), 2500)); }
-    catch (e) { setStockResult({ error: e.message }); }
-    finally { setStockLoading(false); }
+    try {
+      // Individual stock lookup: Haiku is sufficient
+      setStockResult(await callClaude(STOCK_PROMPT(stockQuery.trim()), 1500, MODEL_HAIKU));
+    } catch (e) {
+      setStockResult({ error: e.message });
+    } finally {
+      setStockLoading(false);
+    }
   }
 
   const st   = cycleData ? (STAGE_THEME[cycleData.marketStage] || STAGE_THEME.BULL_STAGE_1) : null;
@@ -475,12 +509,21 @@ export default function BharatOracle() {
               <div style={{ width: 6, height: 6, borderRadius: "50%", background: st.col, boxShadow: "0 0 6px " + st.col }} />
               <span style={{ fontSize: 10, fontWeight: 600, color: st.col }}>{st.short}</span>
               {cycleData && <span style={{ fontSize: 10, color: C.t3 }}>· {cycleData.overallScore}/100</span>}
+              {fromCache && <span style={{ fontSize: 9, color: C.t3, marginLeft: 2 }}>· cached</span>}
             </div>
           )}
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           {cycleData && <span style={{ fontSize: 9, color: C.t3 }}>{cycleData.lastUpdated}</span>}
-          <button onClick={analyseMarket} disabled={phase === "loading"}
+          {/* Force refresh clears cache and re-fetches */}
+          {fromCache && phase === "done" && (
+            <button onClick={() => { clearCache(); analyseMarket(true); }}
+              style={{ padding: "6px 12px", fontSize: 10, fontWeight: 600, cursor: "pointer", borderRadius: 6,
+                border: "1px solid " + C.border, background: "transparent", color: C.t3 }}>
+              Refresh ↺
+            </button>
+          )}
+          <button onClick={() => analyseMarket(false)} disabled={phase === "loading"}
             style={{ padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: phase === "loading" ? "wait" : "pointer", borderRadius: 8,
               border: "1px solid " + C.blue + "50", background: phase === "loading" ? "rgba(77,159,255,0.1)" : "linear-gradient(135deg," + C.blue + "," + C.blue + "cc)",
               color: phase === "loading" ? C.t3 : "#fff", letterSpacing: ".02em", opacity: phase === "loading" ? 0.6 : 1,
@@ -505,11 +548,11 @@ export default function BharatOracle() {
                 <span key={i} style={{ fontSize: 10, padding: "4px 10px", borderRadius: 20, background: C.card, color: C.t3, border: "1px solid " + C.border }}>{t}</span>
               ))}
             </div>
-            <button onClick={analyseMarket} style={{ padding: "12px 32px", fontSize: 14, fontWeight: 700, cursor: "pointer", borderRadius: 10, border: "none",
+            <button onClick={() => analyseMarket(false)} style={{ padding: "12px 32px", fontSize: 14, fontWeight: 700, cursor: "pointer", borderRadius: 10, border: "none",
               background: "linear-gradient(135deg," + C.blue + "," + C.blue + "aa)", color: "#fff", boxShadow: "0 6px 24px rgba(77,159,255,0.4)", letterSpacing: ".02em" }}>
               Analyse Market Now ↗
             </button>
-            <div style={{ fontSize: 10, color: C.t3, marginTop: 12 }}>2 API calls · Live web search · ~60 seconds</div>
+            <div style={{ fontSize: 10, color: C.t3, marginTop: 12 }}>Sonnet for analysis · Haiku for stocks · 2hr cache · ~60s first run</div>
           </div>
         )}
 
@@ -519,7 +562,7 @@ export default function BharatOracle() {
             <div style={{ background: C.card, borderRadius: 12, border: "1px solid " + C.border, padding: "24px 28px", marginBottom: 24, display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap" }}>
               <div style={{ width: 36, height: 36, borderRadius: "50%", border: "3px solid " + C.blue + "40", borderTopColor: C.blue, animation: "spin 1s linear infinite", flexShrink: 0 }} />
               <div>
-                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.1em", color: C.t3, marginBottom: 4 }}>Step {step + 1} of 2 — {step === 0 ? "Market Cycle Analysis" : "Stock Recommendations"}</div>
+                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.1em", color: C.t3, marginBottom: 4 }}>Step {step + 1} of 2 — {step === 0 ? "Market Cycle Analysis (Sonnet)" : "Stock Recommendations (Haiku)"}</div>
                 <div style={{ fontSize: 15, fontWeight: 500, color: C.t1 }}>{msgs[msgIdx]}</div>
                 <div style={{ fontSize: 10, color: C.t3, marginTop: 2 }}>Searching live Indian market data…</div>
               </div>
@@ -556,7 +599,7 @@ export default function BharatOracle() {
               <div style={{ fontSize: 12, fontWeight: 600, color: C.red, marginBottom: 2 }}>Analysis Error</div>
               <div style={{ fontSize: 11, color: C.t2 }}>{errMsg}</div>
             </div>
-            <button onClick={analyseMarket} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid " + C.red + "50", background: C.redBg, color: C.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Retry ↗</button>
+            <button onClick={() => analyseMarket(true)} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid " + C.red + "50", background: C.redBg, color: C.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Retry ↗</button>
           </div>
         )}
 
