@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 
-const MODEL = "claude-sonnet-4-20250514";
+const MODEL = "claude-sonnet-4-6";
 
 // ─── JSON repair + parse ───────────────────────────────────────────────────
 function safeParseJSON(raw) {
@@ -15,40 +15,55 @@ function safeParseJSON(raw) {
   return JSON.parse(s);
 }
 
-// NOTE: Update the URL endpoint if you transition this to a backend proxy/Netlify edge function to avoid CORS blocks
+// ─── API call ──────────────────────────────────────────────────────────────
+// LOCAL DEV  (npm run dev)  → calls Anthropic directly via VITE_ANTHROPIC_API_KEY in .env.local
+// NETLIFY production        → calls /.netlify/functions/claude  (key stays server-side)
+const IS_LOCAL = import.meta.env.DEV;
+const API_URL  = IS_LOCAL
+  ? "https://api.anthropic.com/v1/messages"
+  : "/.netlify/functions/claude";
+
 async function callClaude(prompt, maxTokens) {
-    // We route through a public CORS proxy for local client-side testing
-    const proxyUrl = "https://cors-anywhere.herokuapp.com/";
-    const targetUrl = "https://api.anthropic.com/v1/messages";
-    
-    const res = await fetch(proxyUrl + targetUrl, {
-      method: "POST", 
-      headers: { 
-        "Content-Type": "application/json",
-        "x-requested-with": "XMLHttpRequest", // Required by cors-anywhere
-        "x-api-key": import.meta.env.VITE_ANTHROPIC_API_KEY || "", 
-        "anthropic-version": "2023-06-01" // Crucial header for Anthropic production servers
-      },
-      body: JSON.stringify({
-        model: MODEL, 
-        max_tokens: maxTokens || 4000,
-        tools: [{ type: "web_search_20250305", name: "web_search" }],
-        messages: [{ role: "user", content: prompt }]
-      })
-    });
-    
-    if (res.status === 403) {
-      throw new Error("CORS Proxy Access Required. Please visit https://cors-anywhere.herokuapp.com/corsdemo and click 'Request temporary access' to unlock live local API requests.");
-    }
-    
-    if (!res.ok) throw new Error("HTTP " + res.status + " - Unauthorized/Invalid request parsing.");
-    const data = await res.json();
-    if (data.error) throw new Error(data.error.message);
-    let text = "";
-    for (const b of data.content || []) if (b.type === "text") text += b.text;
-    if (!text) throw new Error("Empty response");
-    return safeParseJSON(text);
+  if (IS_LOCAL && !import.meta.env.VITE_ANTHROPIC_API_KEY) {
+    throw new Error(
+      "Missing API key. Create a .env.local file in the project root:\nVITE_ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxx"
+    );
   }
+
+  // In local dev we call Anthropic directly — the special header opts-in to browser access.
+  // On Netlify the request goes to our serverless proxy which adds the key server-side.
+  const headers = {
+    "Content-Type": "application/json",
+    ...(IS_LOCAL && {
+      "x-api-key": import.meta.env.VITE_ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true"
+    })
+  };
+
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: maxTokens || 4000,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+
+  if (!res.ok) {
+    let msg = "HTTP " + res.status;
+    try { const e = await res.json(); msg = e?.error?.message || msg; } catch (_) {}
+    throw new Error(msg);
+  }
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  let text = "";
+  for (const b of data.content || []) if (b.type === "text") text += b.text;
+  if (!text) throw new Error("Empty response");
+  return safeParseJSON(text);
+}
 
 // ─── Prompts ───────────────────────────────────────────────────────────────
 const CYCLE_PROMPT = `You are an Indian equity analyst. Search the web for CURRENT data (May 2026):
@@ -408,7 +423,6 @@ export default function BharatOracle() {
     } catch (e) {
       setErrMsg(e.message || "Analysis failed"); setPhase("error");
     }
-    console.log("Testing Key Integration:", import.meta.env.VITE_ANTHROPIC_API_KEY ? "Key Found!" : "Key is Missing");
   }
 
   async function analyseStock() {
